@@ -1,6 +1,7 @@
 use anyhow::Result;
 use reqwest::Client;
 use scraper::{Html, Selector};
+use url::Url;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -20,9 +21,23 @@ async fn main() -> Result<()> {
         }
     }
 
+    let base = Url::parse(url)?;
+
     println!("Links found : {}", links.len());
-    for l in links.iter().take(50) {
-        println!(" {}", l)
+    for raw in links {
+        if let Some(abs) = resolve_and_normalize(&base, &raw) {
+            println!(" {}", abs)
+        }
     }
     Ok(())
+}
+
+fn resolve_and_normalize(base: &Url, href: &str) -> Option<Url> {
+    match base.join(href) {
+        Ok(mut u) => {
+            u.set_fragment(None);
+            Some(u)
+        }
+        Err(_) => None,
+    }
 }
