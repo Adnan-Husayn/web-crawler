@@ -1,5 +1,6 @@
 use anyhow::Result;
 use reqwest::Client;
+use scraper::{Html, Selector};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -7,10 +8,21 @@ async fn main() -> Result<()> {
 
     let url = "https://google.com/";
     let resp = client.get(url).send().await?;
-    let status = resp.status();
     let body = resp.text().await?;
-    println!("status: {}", status);
-    println!("body length: {}", body.len());
-    println!("first 400 chars:\n{}", &body[..body.len().min(400)]);
+
+    let document = Html::parse_document(&body);
+    let selector = Selector::parse("a[href]").unwrap();
+
+    let mut links = Vec::new();
+    for elements in document.select(&selector) {
+        if let Some(href) = elements.value().attr("href") {
+            links.push(href.to_string())
+        }
+    }
+
+    println!("Links found : {}", links.len());
+    for l in links.iter().take(50) {
+        println!(" {}", l)
+    }
     Ok(())
 }
