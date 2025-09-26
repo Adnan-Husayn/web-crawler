@@ -1,82 +1,109 @@
 use anyhow::Result;
 use reqwest::Client;
 use scraper::{Html, Selector};
-use std::collections::{HashSet, VecDeque};
+use std::sync::Arc;
+use tokio::sync::{Mutex, Semaphore, mpsc};
 use url::Url;
+
+#[derive(Clone)]
+struct Task {
+    url: Url,
+    depth: usize,
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let client = Client::builder().user_agent("RustCrawler/0.1").build()?;
+    let client = Arc::new(Client::builder().user_agent("RustCrawler/0.1").build()?);
     let url = "https://google.com/";
     let seed = Url::parse(url)?;
-    let max_pages = 50;
+    let max_pages = 100usize;
+    let concurrency = 10usize;
 
-    let mut frontier: VecDeque<(Url, usize)> = VecDeque::new();
-    frontier.push_back((seed.clone(), 0));
-    let mut visited: HashSet<String> = HashSet::new();
+    let (tx, mut rx) = mpsc::channel::<Task>(1000);
+    tx.send(Task {
+        url: seed.clone(),
+        depth: 0,
+    })
+    .await
+    .unwrap();
 
+    let visited = Arc::new(Mutex::new(std::collections::HashSet::<String>::new()));
     let selector = Selector::parse("a[href]").unwrap();
+    let sem = Arc::new(Semaphore::new(concurrency));
+    let pages_count = Arc::new(Mutex::new(0usize));
 
-    while let Some((url, depth)) = frontier.pop_front() {
-        if visited.len() >= max_pages {
-            break;
-        }
-        let norm = {
-            let mut temp = url.clone();
-            temp.set_fragment(None);
-            temp.to_string()
-        };
-        if visited.contains(&norm) {
-            continue;
-        }
-        println!("Fetching {} (depth = {})", url, depth);
+    let mut handles = Vec::new();
+    let worker_count = 4;
 
-        let body = match client.get(url.clone()).send().await {
-            Ok(resp) => {
-                if !resp.status().is_success() {
-                    eprintln!("Non-success: {}", resp.status())
-                }
-                match resp.text().await {
-                    Ok(t) => t,
-                    Err(e) => {
-                        eprintln!("Read error: {:?}", e);
-                        continue;
+    for _ in 0..worker_count {
+        let client = client.clone();
+        let mut rx = rx.clone();
+        let visited = visited.clone();
+        let sem = sem.clone();
+        let selector = selector.clone();
+        let pages_count = pages_count.clone();
+        let tx = tx.clone();
+
+        let handle = tokio::spawn(async move {
+            while let Some(task) = rx.recv().await {
+                {
+                    let count = *pages_count.lock().await;
+                    if count >= max_pages {
+                        break;
                     }
                 }
-            }
-            Err(e) => {
-                eprintln!("Request error: {:?}", e);
-                continue;
-            }
-        };
 
-        visited.insert(norm);
+                let mut vis = visited.lock().await;
+                let mut norm = task.url.clone();
+                norm.set_fragment(None);
+                let norm_str = norm.to_string();
+                if vis.contains(&norm_str) {
+                    continue;
+                }
+                vis.insert(norm_str.clone());
+                drop(vis);
 
-        let document = Html::parse_document(&body);
-        for el in document.select(&selector) {
-            if let Some(href) = el.value().attr("href") {
-                if let Ok(child) = url.join(href) {
-                    let mut child_norm = child.clone();
-                    child_norm.set_fragment(None);
-                    let child_str = child_norm.to_string();
-                    if !visited.contains(&child_str) {
-                        frontier.push_back((child, depth + 1));
+                let permit = sem.acquire().await.unwrap();
+
+                let res = client.get(task.url.clone()).send().await;
+
+                drop(permit);
+
+                match res {
+                    Ok(resp) => {
+                        if resp.status().is_success() {
+                            if let Ok(body) = resp.text().await {
+                                // parse and enqueue children
+                                let doc = Html::parse_document(&body);
+                                for el in doc.select(&selector) {
+                                    if let Some(href) = el.value().attr("href") {
+                                        if let Ok(child_url) = task.url.join(href) {
+                                            tx.send(Task {
+                                                url: child_url,
+                                                depth: task.depth + 1,
+                                            })
+                                            .await
+                                            .ok();
+                                        }
+                                    }
+                                }
+                                let mut c = pages_count.lock().await;
+                                *c += 1;
+                                println!("Visited: {} total={}", task.url, *c);
+                            }
+                        }
                     }
+                    Err(e) => eprintln!("Fetch error {}: {:?}", task.url, e),
                 }
             }
-        }
+        });
+        handles.push(handle);
     }
 
-    println!("Done. Visited {} pages", visited.len());
+    drop(tx);
+    for h in handles {
+        let _ = h.await;
+    }
+    println!("Crawl done");
     Ok(())
-}
-
-fn resolve_and_normalize(base: &Url, href: &str) -> Option<Url> {
-    match base.join(href) {
-        Ok(mut u) => {
-            u.set_fragment(None);
-            Some(u)
-        }
-        Err(_) => None,
-    }
 }
