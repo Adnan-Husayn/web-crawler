@@ -18,57 +18,71 @@ async fn main() -> Result<()> {
     let seed = Url::parse(url)?;
     let max_pages = 100usize;
     let concurrency = 10usize;
-
+    
     let (tx, mut rx) = mpsc::channel::<Task>(1000);
+    
     tx.send(Task {
         url: seed.clone(),
         depth: 0,
     })
     .await
     .unwrap();
-
+    
     let visited = Arc::new(Mutex::new(std::collections::HashSet::<String>::new()));
     let selector = Selector::parse("a[href]").unwrap();
     let sem = Arc::new(Semaphore::new(concurrency));
     let pages_count = Arc::new(Mutex::new(0usize));
-
+    
+    // Create a separate channel for distributing tasks to workers
+    let (work_tx, work_rx) = async_channel::bounded::<Task>(1000);
+    let work_rx = Arc::new(work_rx);
+    
+    // Task distributor - moves tasks from mpsc to async_channel
+    let work_tx_clone = work_tx.clone();
+    let distributor = tokio::spawn(async move {
+        while let Some(task) = rx.recv().await {
+            if work_tx_clone.send(task).await.is_err() {
+                break;
+            }
+        }
+    });
+    
     let mut handles = Vec::new();
     let worker_count = 4;
-
+    
     for _ in 0..worker_count {
         let client = client.clone();
-        let mut rx = rx.clone();
+        let work_rx = work_rx.clone();
         let visited = visited.clone();
         let sem = sem.clone();
         let selector = selector.clone();
         let pages_count = pages_count.clone();
         let tx = tx.clone();
-
+        
         let handle = tokio::spawn(async move {
-            while let Some(task) = rx.recv().await {
+            while let Ok(task) = work_rx.recv().await {
                 {
                     let count = *pages_count.lock().await;
                     if count >= max_pages {
                         break;
                     }
                 }
-
+                
                 let mut vis = visited.lock().await;
                 let mut norm = task.url.clone();
                 norm.set_fragment(None);
                 let norm_str = norm.to_string();
+                
                 if vis.contains(&norm_str) {
                     continue;
                 }
                 vis.insert(norm_str.clone());
                 drop(vis);
-
+                
                 let permit = sem.acquire().await.unwrap();
-
                 let res = client.get(task.url.clone()).send().await;
-
                 drop(permit);
-
+                
                 match res {
                     Ok(resp) => {
                         if resp.status().is_success() {
@@ -87,6 +101,7 @@ async fn main() -> Result<()> {
                                         }
                                     }
                                 }
+                                
                                 let mut c = pages_count.lock().await;
                                 *c += 1;
                                 println!("Visited: {} total={}", task.url, *c);
@@ -99,11 +114,18 @@ async fn main() -> Result<()> {
         });
         handles.push(handle);
     }
-
+    
     drop(tx);
+    drop(work_tx);
+    
+    // Wait for distributor to finish
+    let _ = distributor.await;
+    
+    // Wait for all workers
     for h in handles {
         let _ = h.await;
     }
+    
     println!("Crawl done");
     Ok(())
 }
