@@ -1,9 +1,9 @@
 use anyhow::Result;
 use reqwest::Client;
 use scraper::{Html, Selector};
-use std::sync::Arc;
-use tokio::sync::{Mutex, Semaphore, mpsc};
-use url::Url;
+use std::{sync::Arc, time::Duration};
+use tokio::{sync::{mpsc, Mutex, Semaphore}, time::sleep};
+use url::{Host, Url};
 
 #[derive(Clone)]
 struct Task {
@@ -13,11 +13,17 @@ struct Task {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let client = Arc::new(Client::builder().user_agent("RustCrawler/0.1").build()?);
     let url = "https://google.com/";
     let seed = Url::parse(url)?;
     let max_pages = 100usize;
     let concurrency = 10usize;
+    let worker_count = 4usize;
+    let max_depth = 3usize;
+    let same_host_only = true;
+    let timeout = Duration::from_secs(15);
+    let max_retries = 2usize;
+    
+    let client = Arc::new(Client::builder().user_agent("RustCrawler/0.1").timeout(timeout).build()?);
     
     let (tx, mut rx) = mpsc::channel::<Task>(1000);
     
@@ -33,11 +39,9 @@ async fn main() -> Result<()> {
     let sem = Arc::new(Semaphore::new(concurrency));
     let pages_count = Arc::new(Mutex::new(0usize));
     
-    // Create a separate channel for distributing tasks to workers
     let (work_tx, work_rx) = async_channel::bounded::<Task>(1000);
     let work_rx = Arc::new(work_rx);
     
-    // Task distributor - moves tasks from mpsc to async_channel
     let work_tx_clone = work_tx.clone();
     let distributor = tokio::spawn(async move {
         while let Some(task) = rx.recv().await {
@@ -48,7 +52,6 @@ async fn main() -> Result<()> {
     });
     
     let mut handles = Vec::new();
-    let worker_count = 4;
     
     for _ in 0..worker_count {
         let client = client.clone();
@@ -58,6 +61,11 @@ async fn main() -> Result<()> {
         let selector = selector.clone();
         let pages_count = pages_count.clone();
         let tx = tx.clone();
+        let seed_host = seed.host_str().map(|s| s.to_string());
+        let same_host_only = same_host_only;
+        let max_pages = max_pages;
+        let max_depth = max_depth;
+        let max_retries = max_retries;
         
         let handle = tokio::spawn(async move {
             while let Ok(task) = work_rx.recv().await {
@@ -67,65 +75,147 @@ async fn main() -> Result<()> {
                         break;
                     }
                 }
-                
-                let mut vis = visited.lock().await;
-                let mut norm = task.url.clone();
-                norm.set_fragment(None);
-                let norm_str = norm.to_string();
-                
-                if vis.contains(&norm_str) {
-                    continue;
+
+                let mut norm_url = task.url.clone();
+                norm_url.set_fragment(None);
+                let norm_str = normalize_url(norm_url.clone());
+
+                {
+                    let mut vis = visited.lock().await;
+                    if vis.contains(&norm_str) {
+                        continue;
+                    }
+                    vis.insert(norm_str.clone());
                 }
-                vis.insert(norm_str.clone());
-                drop(vis);
                 
                 let permit = sem.acquire().await.unwrap();
-                let res = client.get(task.url.clone()).send().await;
-                drop(permit);
                 
-                match res {
-                    Ok(resp) => {
-                        if resp.status().is_success() {
-                            if let Ok(body) = resp.text().await {
-                                // parse and enqueue children
-                                let doc = Html::parse_document(&body);
-                                for el in doc.select(&selector) {
-                                    if let Some(href) = el.value().attr("href") {
-                                        if let Ok(child_url) = task.url.join(href) {
-                                            tx.send(Task {
-                                                url: child_url,
-                                                depth: task.depth + 1,
-                                            })
-                                            .await
-                                            .ok();
-                                        }
+                let mut attempt = 0;
+                let mut maybe_body: Option<String> = None;
+                loop {
+                    attempt += 1;
+                    match client.get(task.url.clone()).send().await {
+                        Ok(resp) => {
+                            if resp.status().is_success() {
+                                match resp.text().await {
+                                    Ok(text) => {
+                                        maybe_body = Some(text);
+                                        break;
+                                    }
+                                    Err(e) => {
+                                        eprintln!("Error reading body {}: {:?}", task.url, e);
                                     }
                                 }
-                                
-                                let mut c = pages_count.lock().await;
-                                *c += 1;
-                                println!("Visited: {} total={}", task.url, *c);
+                            } else {
+                                eprintln!("Non-success {}: {}", task.url, resp.status());
                             }
                         }
+                        Err(e) => {
+                            eprintln!("Fetch error {}: {:?}", task.url, e);
+                        }
                     }
-                    Err(e) => eprintln!("Fetch error {}: {:?}", task.url, e),
+                    if attempt > max_retries {
+                        break;
+                    }
+                    let backoff = Duration::from_millis(500 * attempt as u64);
+                    sleep(backoff).await;
+                }
+
+                drop(permit);
+
+                if let Some(body) = maybe_body {
+                    let child_urls = {
+                        let doc = Html::parse_document(&body);
+                        let mut urls = Vec::new();
+
+                        for el in doc.select(&selector) {
+                            if let Some(href) = el.value().attr("href") {
+                                let href_l = href.trim();
+                                if href_l.starts_with('#')
+                                    || href_l.starts_with("javascript:")
+                                    || href_l.starts_with("mailto:")
+                                    || href_l.starts_with("tel:")
+                                {
+                                    continue;
+                                }
+                                if let Ok(child_url) = task.url.join(href_l) {
+                                    match child_url.scheme() {
+                                        "http" | "https" => urls.push(child_url),
+                                        _ => {}
+                                    }
+                                }
+                            }
+                        }
+                        urls
+                    };
+
+                    if task.depth < max_depth {
+                        for child_url in child_urls {
+                            if same_host_only {
+                                if let (Some(seed_h), Some(child_h)) =
+                                    (seed_host.as_ref(), child_url.host_str())
+                                {
+                                    if seed_h != child_h {
+                                        continue;
+                                    }
+                                } else {
+                                    continue;
+                                }
+                            }
+
+                            tx.send(Task {
+                                url: child_url,
+                                depth: task.depth + 1,
+                            })
+                            .await
+                            .ok();
+                        }
+                    }
+
+                    {
+                        let mut c = pages_count.lock().await;
+                        *c += 1;
+                        println!("Visited: {} total={}", task.url, *c);
+                    }
                 }
             }
         });
+
         handles.push(handle);
     }
-    
+
     drop(tx);
     drop(work_tx);
-    
-    // Wait for distributor to finish
+
     let _ = distributor.await;
-    
-    // Wait for all workers
+
     for h in handles {
         let _ = h.await;
     }
-    
+
     println!("Crawl done");
     Ok(())
+}
+
+fn normalize_url(mut url : Url) -> String {
+    url.set_fragment(None);
+    if let Some(host) = url.host_str() {
+        let mut parts = url.clone().into_string();
+
+        if let Ok(mut reparsed) = Url::parse(&parts) {
+            if let Some(h) = reparsed.host_str() {
+                let low = h.to_ascii_lowercase();
+                let _ = reparsed.set_host(Some(&low));
+            }
+            if (reparsed.scheme() == "http" && reparsed.port_or_known_default() == Some(80))
+                || (reparsed.scheme() == "https" && reparsed.port_or_known_default() == Some(443))
+            {
+                let _ = reparsed.set_port(None);
+            }
+            let s = reparsed.into_string();
+            return s;
+        }
+    }
+
+    url.to_string()
 }
