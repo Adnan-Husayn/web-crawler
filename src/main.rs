@@ -1,13 +1,26 @@
 use anyhow::Result;
 use reqwest::Client;
 use scraper::{Html, Selector};
+use tokio::io::AsyncWriteExt;
+use std::f32::consts::E;
 use std::{sync::Arc, time::Duration};
+use tokio::fs::OpenOptions;
 use tokio::{sync::{mpsc, Mutex, Semaphore}, time::sleep};
 use url::{Host, Url};
+use serde::Serialize;
 
 #[derive(Clone)]
 struct Task {
     url: Url,
+    depth: usize,
+}
+
+#[derive(Serialize)]
+struct Item {
+    url: String,
+    title: Option<String>,
+    description: Option<String>,
+    status: u16,
     depth: usize,
 }
 
@@ -22,10 +35,12 @@ async fn main() -> Result<()> {
     let same_host_only = true;
     let timeout = Duration::from_secs(15);
     let max_retries = 2usize;
+    let output_file = "scraped.jsonl";
     
     let client = Arc::new(Client::builder().user_agent("RustCrawler/0.1").timeout(timeout).build()?);
     
     let (tx, mut rx) = mpsc::channel::<Task>(1000);
+    let (item_tx, mut item_rx) = mpsc::channel::<Item>(1000);
     
     tx.send(Task {
         url: seed.clone(),
@@ -50,6 +65,34 @@ async fn main() -> Result<()> {
             }
         }
     });
+
+    let writer_handle = {
+        let output_file = output_file.to_string();
+        tokio::spawn(async move {
+            let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&output_file)
+            .await
+            .expect("failed to open output file");
+            
+            while let Some(item) = item_rx.recv().await {
+                match serde_json::to_vec(&item) {
+                    Ok(mut bytes) => {
+                        bytes.push(b'\n');
+                        if let Err(e) = file.write_all(&bytes).await {
+                            eprintln!("Failed to write item: {:?}", e)
+                        }
+                    },
+                    Err(e) => {
+                        eprintln!("Serialization error: {:?}", e);
+                    }
+                }
+            }
+            let _ = file.flush().await;
+            println!("Writer task finished");
+        })
+    };
     
     let mut handles = Vec::new();
     
@@ -92,10 +135,12 @@ async fn main() -> Result<()> {
                 
                 let mut attempt = 0;
                 let mut maybe_body: Option<String> = None;
+                let mut status_code: u16 = 0;
                 loop {
                     attempt += 1;
                     match client.get(task.url.clone()).send().await {
                         Ok(resp) => {
+                            status_code = resp.status().as_u16();
                             if resp.status().is_success() {
                                 match resp.text().await {
                                     Ok(text) => {
@@ -124,6 +169,7 @@ async fn main() -> Result<()> {
                 drop(permit);
 
                 if let Some(body) = maybe_body {
+                    
                     let child_urls = {
                         let doc = Html::parse_document(&body);
                         let mut urls = Vec::new();
