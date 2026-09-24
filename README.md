@@ -111,3 +111,7 @@ Unit tests cover URL normalization and `robots.txt` parsing/matching.
 
 Please only crawl sites you have permission to crawl, and keep the default
 robots.txt handling on.
+
+## License
+
+MIT — see [LICENSE](LICENSE).

@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 description = "A concurrent, robots.txt-aware web crawler that writes page metadata as JSON Lines"
 readme = "README.md"
+license = "MIT"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
