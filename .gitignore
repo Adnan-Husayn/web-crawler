@@ -1,1 +1,10 @@
+# Build output
 /target
+
+# Crawl output
+*.jsonl
+
+# OS / editor files
+.DS_Store
+.idea/
+.vscode/
