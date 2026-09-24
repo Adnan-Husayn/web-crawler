@@ -455,14 +455,14 @@ fn parse_page(ctx: &Ctx, base: &Url, body: &str) -> (Option<String>, Option<Stri
     let title = doc
         .select(&ctx.selectors.title)
         .next()
-        .map(|el| el.text().collect::<String>().trim().to_string())
+        .map(|el| collapse_whitespace(&el.text().collect::<String>()))
         .filter(|s| !s.is_empty());
 
     let description = doc
         .select(&ctx.selectors.description)
         .next()
         .and_then(|el| el.value().attr("content"))
-        .map(|s| s.trim().to_string())
+        .map(collapse_whitespace)
         .filter(|s| !s.is_empty());
 
     let mut urls = Vec::new();
@@ -490,14 +490,27 @@ fn parse_page(ctx: &Ctx, base: &Url, body: &str) -> (Option<String>, Option<Stri
     (title, description, urls)
 }
 
+fn collapse_whitespace(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 /// Canonical form used as the dedupe key. The `url` crate already lowercases
 /// the scheme/host and drops default ports; on top of that this strips the
-/// fragment, removes trailing slashes (except the root), and sorts query
-/// parameters.
+/// fragment, drops a trailing `index.html`/`index.htm`/`index.php`, removes
+/// trailing slashes (except the root), and sorts query parameters.
 fn normalize_url(mut url: Url) -> String {
     url.set_fragment(None);
 
-    let path = url.path().to_string();
+    let mut path = url.path().to_string();
+    for name in ["index.html", "index.htm", "index.php"] {
+        if let Some(prefix) = path.strip_suffix(name)
+            && prefix.ends_with('/')
+        {
+            path = prefix.to_string();
+            url.set_path(&path);
+            break;
+        }
+    }
     if path.len() > 1 && path.ends_with('/') {
         url.set_path(path.trim_end_matches('/'));
     }
@@ -842,6 +855,24 @@ mod tests {
     fn normalize_trims_trailing_slash_but_not_root() {
         assert_eq!(norm("https://x.com/a/"), "https://x.com/a");
         assert_eq!(norm("https://x.com/"), "https://x.com/");
+    }
+
+    #[test]
+    fn normalize_treats_index_files_as_directory() {
+        assert_eq!(norm("https://x.com/index.html"), "https://x.com/");
+        assert_eq!(norm("https://x.com/a/index.php"), "https://x.com/a");
+        assert_eq!(
+            norm("https://x.com/reindex.html"),
+            "https://x.com/reindex.html"
+        );
+    }
+
+    #[test]
+    fn collapse_whitespace_flattens_newlines() {
+        assert_eq!(
+            collapse_whitespace("Travel | \n     Books  "),
+            "Travel | Books"
+        );
     }
 
     #[test]
